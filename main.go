@@ -2,18 +2,29 @@ package main
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
+var jobIds = make(map[string]int)
+var jobIdsMtx sync.Mutex
+
 func main() {
 	e := echo.New()
-	e.GET("/progressbar", progressBarUpdate)
+
+	e.GET("/progressbar", func(c echo.Context) error {
+
+		progressBarUpdate(c)
+
+		return c.HTML(http.StatusOK, "progressbar.html")
+	})
 
 	e.GET("/", func(c echo.Context) error {
 		return c.HTML(http.StatusOK, `
@@ -32,19 +43,10 @@ func main() {
 					<input type="checkbox" id="deleteInputFile" name="deleteInputFile">
 					<label for="deleteInputFile">Delete input file after conversion</label><br>
 					<input type="submit" value="Convert">
-				</form>
-					
-   					<progress id="myProgressBar" value="0" max="100"></progress>
-					
+				</form>				
 			</body>
    <script>
-    const progressBar = document.getElementById("myProgressBar");
-        const evtSource = new EventSource("/progressbar");
-
-        evtSource.onmessage = (event) => {
-            const value = parseInt(event.data);
-            progressBar.value = value;
-        };
+  
     </script>
 
 			</html>
@@ -52,31 +54,64 @@ func main() {
 	})
 
 	e.POST("/convert", func(c echo.Context) error {
-		folderPath := c.FormValue("folderPath")
+		//folderPath := c.FormValue("folderPath")
 		outputFolderPath := c.FormValue("outputFolderPath")
-		delteCheckBox := c.FormValue("deleteInputFile")
+		//delteCheckBox := c.FormValue("deleteInputFile")
 
-		filename := ""
 		if err := os.MkdirAll(outputFolderPath, 0755); err != nil {
 			fmt.Println("Error creating output folder:", err)
 			return err
 		}
 
-		files, err := filepath.Glob(filepath.Join(folderPath, "*"))
-		if err != nil {
-			fmt.Println("Error reading folder:", err)
-			return err
-		}
+		//	files, err := filepath.Glob(filepath.Join(folderPath, "*"))
+		//if err != nil {
+		//		fmt.Println("Error reading folder:", err)
+		//		return err
+		//	}
+		jobNumber := spawnJob()
+		return c.Redirect(http.StatusFound, "/progressbar/"+jobNumber)
+	})
+	// uuid above is conntect to the uuid below it gets it from the web address
+	e.GET("/progressbar/:uuid", func(c echo.Context) error {
 
-		for _, file := range files {
+		uuid := c.Param("uuid")
 
-			filename = convertMedia(file, outputFolderPath, delteCheckBox)
-		}
-
-		return c.String(http.StatusOK, "Video conversion completed!"+filename)
+		progress := getJobProgress(uuid)
+		fmt.Println(progress)
+		return c.String(http.StatusOK, fmt.Sprintf("Received ID: %s", uuid))
 	})
 
 	e.Start(":8080")
+}
+
+func spawnJob() string {
+	jobIdNumber := genrateUUID()
+
+	go func() {
+		setJobProgress(jobIdNumber, 0)
+		fmt.Println(jobIdNumber)
+		time.Sleep(10000)
+		setJobProgress(jobIdNumber, 100)
+	}()
+
+	return jobIdNumber
+}
+
+func setJobProgress(jobUUID string, progress int) {
+
+	jobIdsMtx.Lock()
+	jobIds[jobUUID] = progress
+	jobIdsMtx.Unlock()
+
+}
+
+func getJobProgress(jobUUID string) int {
+
+	jobIdsMtx.Lock()
+	progress := jobIds[jobUUID]
+	jobIdsMtx.Unlock()
+
+	return progress
 }
 
 func convertMedia(file string, outputFolderPath string, delteCheckBox string) string {
@@ -90,6 +125,7 @@ func convertMedia(file string, outputFolderPath string, delteCheckBox string) st
 		outputFile := filepath.Join(outputFolderPath, strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))+".mp4")
 
 		cmd := exec.Command("ffmpeg-2024-02-04-git-7375a6ca7b-full_build/bin/ffmpeg.exe", "-i", file, "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-y", outputFile)
+
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 
@@ -99,10 +135,21 @@ func convertMedia(file string, outputFolderPath string, delteCheckBox string) st
 		} else {
 			fmt.Printf("Converted %s to %s\n", file, outputFile)
 			filename = file
+
 			return filename
 		}
 	}
 	return "file format not supported please enter a reqest to have this format supported"
+}
+
+func genrateUUID() string {
+
+	uuidWithHyphen := uuid.New()
+	fmt.Println(uuidWithHyphen)
+
+	// Convert UUID to a string without hyphens
+	uuidString := strings.Replace(uuidWithHyphen.String(), "-", "", -1)
+	return uuidString
 }
 
 func progressBarUpdate(c echo.Context) error {
