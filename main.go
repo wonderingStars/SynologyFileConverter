@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
+	"html/template"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,15 +19,28 @@ import (
 var jobIds = make(map[string]int)
 var jobIdsMtx sync.Mutex
 
+type TemplateRenderer struct {
+	templates *template.Template
+}
+
+// Render renders a template document
+func (t *TemplateRenderer) Render(w io.Writer, name string, data interface{}, c echo.Context) error {
+
+	// Add global methods if data is a map
+	if viewContext, isMap := data.(map[string]interface{}); isMap {
+		viewContext["reverse"] = c.Echo().Reverse
+	}
+
+	return t.templates.ExecuteTemplate(w, name, data)
+}
+
 func main() {
 	e := echo.New()
+	renderer := &TemplateRenderer{
+		templates: template.Must(template.ParseGlob("*.html")),
+	}
 
-	e.GET("/progressbar", func(c echo.Context) error {
-
-		progressBarUpdate(c)
-
-		return c.HTML(http.StatusOK, "progressbar.html")
-	})
+	e.Renderer = renderer
 
 	e.GET("/", func(c echo.Context) error {
 		return c.HTML(http.StatusOK, `
@@ -44,17 +60,27 @@ func main() {
 					<label for="deleteInputFile">Delete input file after conversion</label><br>
 					<input type="submit" value="Convert">
 				</form>				
+				<progress id="myProgressBar" value="0" max="100"></progress>
+					
 			</body>
    <script>
-  
+    const progressBar = document.getElementById("myProgressBar");
+        const evtSource = new EventSource("/progressbar/:uuid");
+
+        evtSource.onmessage = (event) => {
+            const value = parseInt(event.data);
+            progressBar.value = value;
+        };
     </script>
+  
+   
 
 			</html>
 		`)
 	})
 
 	e.POST("/convert", func(c echo.Context) error {
-		//folderPath := c.FormValue("folderPath")
+		folderPath := c.FormValue("folderPath")
 		outputFolderPath := c.FormValue("outputFolderPath")
 		//delteCheckBox := c.FormValue("deleteInputFile")
 
@@ -63,34 +89,83 @@ func main() {
 			return err
 		}
 
-		//	files, err := filepath.Glob(filepath.Join(folderPath, "*"))
-		//if err != nil {
-		//		fmt.Println("Error reading folder:", err)
-		//		return err
-		//	}
-		jobNumber := spawnJob()
-		return c.Redirect(http.StatusFound, "/progressbar/"+jobNumber)
+		files, err := filepath.Glob(filepath.Join(folderPath, "*"))
+		if err != nil {
+			fmt.Println("Error reading folder:", err)
+			return err
+		}
+		var UUID string
+		for _, file := range files {
+
+			fmt.Println(file)
+			UUID = spawnJob(file, outputFolderPath)
+
+		}
+
+		return c.Redirect(http.StatusFound, "/progressbar/"+UUID)
 	})
 	// uuid above is conntect to the uuid below it gets it from the web address
+	////	e.GET("/progressbar/:uuid", func(c echo.Context) error {
+
+	//		uuid := c.Param("uuid")
+
+	//	progress := getJobProgress(uuid)
+	//		fmt.Println(progress)
+
+	//		fmt.Fprintf(c.Response(), "data: %d\n\n", progress)
+	//		return c.String(http.StatusOK, fmt.Sprintf("Received ID: %s progress %d", uuid, progress))
+	//	})
 	e.GET("/progressbar/:uuid", func(c echo.Context) error {
 
 		uuid := c.Param("uuid")
 
 		progress := getJobProgress(uuid)
 		fmt.Println(progress)
-		return c.String(http.StatusOK, fmt.Sprintf("Received ID: %s", uuid))
+		urlForUUID := "/api/jobs/"
+		m := map[string]string{"url": urlForUUID + uuid}
+
+		return c.Render(http.StatusOK, "ProgressUUIDTemple.html", m)
+
+	})
+
+	e.GET("/api/jobs/:uuid", func(c echo.Context) error {
+
+		return c.String(http.StatusOK, fmt.Sprintf("send uuid List : %s ", 0))
+	})
+
+	e.GET("/api/jobs/:uuid", func(c echo.Context) error {
+		// Set appropriate headers for streaming (e.g., Content-Type, Cache-Control)
+		c.Response().Header().Set("Content-Type", "text/event-stream")
+		c.Response().Header().Set("Cache-Control", "no-cache")
+		uuid := c.Param("uuid")
+		// Continuously send chat messages to the client
+		for {
+			// Get new chat messages from somewhere (e.g., a channel)
+			i := getJobProgress(uuid)
+			message := strconv.Itoa(i)
+
+			// Send the message to the client
+			_, err := c.Response().Write([]byte("data: " + message + "\n\n"))
+			if err != nil {
+				// Handle any errors (e.g., client disconnect)
+				break
+			}
+		}
+
+		return nil
 	})
 
 	e.Start(":8080")
 }
 
-func spawnJob() string {
+func spawnJob(file string, outputFolder string) string {
 	jobIdNumber := genrateUUID()
 
 	go func() {
-		setJobProgress(jobIdNumber, 0)
+		setJobProgress(jobIdNumber, 10)
 		fmt.Println(jobIdNumber)
-		time.Sleep(10000)
+		convertMedia(file, outputFolder)
+		time.Sleep(9000000)
 		setJobProgress(jobIdNumber, 100)
 	}()
 
@@ -114,7 +189,7 @@ func getJobProgress(jobUUID string) int {
 	return progress
 }
 
-func convertMedia(file string, outputFolderPath string, delteCheckBox string) string {
+func convertMedia(file string, outputFolderPath string) string {
 	filename := ""
 
 	if strings.HasSuffix(file, ".mp4") || strings.HasSuffix(file, ".mkv") ||
@@ -124,7 +199,7 @@ func convertMedia(file string, outputFolderPath string, delteCheckBox string) st
 		// Construct the output filename (replace the extension with .mp4)
 		outputFile := filepath.Join(outputFolderPath, strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))+".mp4")
 
-		cmd := exec.Command("ffmpeg-2024-02-04-git-7375a6ca7b-full_build/bin/ffmpeg.exe", "-i", file, "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-y", outputFile)
+		cmd := exec.Command("ffmpeg-6.1.1-essentials_build/bin/ffmpeg.exe", "-i", file, "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-y", outputFile)
 
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
